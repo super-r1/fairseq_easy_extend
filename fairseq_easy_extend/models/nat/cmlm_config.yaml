@@ -6,7 +6,7 @@ task:
   target_lang: en
   noise: random_mask
 criterion:
-  _name: nat_loss
+  _name: rl_loss
 model:
   _name: cmlm_transformer_base
   share_decoder_input_output_embed: true

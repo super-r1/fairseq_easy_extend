@@ -2,6 +2,7 @@ import math
 from argparse import Namespace
 
 import torch
+import torch.nn.functional as F
 from fairseq.criterions import FairseqCriterion, register_criterion
 from fairseq.data import encoders
 from fairseq.dataclass import FairseqDataclass
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 
 from fairseq.logging import metrics
 
+from nltk.translate.bleu_score import sentence_bleu
 
 @dataclass
 class RLCriterionConfig(FairseqDataclass):
@@ -122,6 +124,18 @@ class RLCriterion(FairseqCriterion):
 
         #loss = -log_prob(outputs)*R()
         #loss = loss.mean()
+
+        if masks is not None:
+            outputs, targets =  outputs[masks], targets[masks]
+            probs = F.softmax(outputs, dim=-1)
+            dist = torch.multinomial(probs)
+            sampled_sentence = dist.sample() # OR sampled_sentence = argmax(...)
+            sampled_sentence_string = self.decode(sampled_sentence)
+            if self.metric == "bleu":
+                reward = sentence_bleu(sampled_sentence_string, targets)
+                loss = -dist.log_prob(sampled_sentence) * reward
+        
+        loss = loss.mean()
         
         #Example 2: mask after sampling
         #bsz = outputs.size(0)
@@ -155,7 +169,9 @@ class RLCriterion(FairseqCriterion):
         
         #For more about mask see notes on NLP2-notes-on-mask
 
-
+        else:
+            # TBD
+            loss = 0; reward = 0
 
         return loss, reward.mean()
 
