@@ -1,23 +1,25 @@
 import math
 from argparse import Namespace
-
+import sys
+sys.path.append("/content/bleurt")
+from sys import builtin_module_names
+from torchmetrics import BLEUScore
 import torch
 import torch.nn.functional as F
 from fairseq.criterions import FairseqCriterion, register_criterion
 from fairseq.data import encoders
 from fairseq.dataclass import FairseqDataclass
-
 from dataclasses import dataclass, field
-
 from fairseq.logging import metrics
+from bleurt import score
+from comet import download_model, load_from_checkpoint
+checkpoint = "/content/bleurt/bleurt/BLEURT-20"
 
-from nltk.translate.bleu_score import sentence_bleu
-from torch.distributions.categorical import Categorical
 
 @dataclass
 class RLCriterionConfig(FairseqDataclass):
     sentence_level_metric: str = field(default="bleu",
-                                       metadata={"help": "sentence level metric"})
+                                       metadata={"help": "sentence level metrics bleu bleurt or comet"})
 
 
 @register_criterion("rl_loss", dataclass=RLCriterionConfig)
@@ -29,7 +31,16 @@ class RLCriterion(FairseqCriterion):
             tokenizer='moses'
         ))
         self.tgt_dict = task.target_dictionary
-
+        self.src_dict = task.source_dictionary
+        self.bleu_score = BLEUScore(n_gram=1)
+        if self.metric == "comet":
+          model_path = download_model("Unbabel/wmt22-comet-da")
+          comet_model = load_from_checkpoint(model_path)
+          self.comet_score = comet_model.predict
+        elif self.metric == "bleurt":
+          checkpoint = "/content/bleurt/bleurt/BLEURT-20"
+          self.bleurt_score = score.BleurtScorer(checkpoint).score
+            
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
         Returns a tuple with three elements:
@@ -45,13 +56,12 @@ class RLCriterion(FairseqCriterion):
             sample["net_input"]["src_lengths"],
         )
         tgt_tokens, prev_output_tokens = sample["target"], sample["prev_target"]
-
         outputs = model(src_tokens, src_lengths, prev_output_tokens, tgt_tokens)
         #get loss only on tokens, not on lengths
         outs = outputs["word_ins"].get("out", None)
         masks = outputs["word_ins"].get("mask", None)
 
-        loss, reward = self._compute_loss(outs, tgt_tokens, masks)
+        loss, reward = self._compute_loss(outs, tgt_tokens, src_tokens, masks)
 
         # NOTE:
         # we don't need to use sample_size as denominator for the gradient
@@ -84,8 +94,23 @@ class RLCriterion(FairseqCriterion):
             )
             s = self.tokenizer.decode(s)
         return s
-
-    def compute_reward(self, outputs, targets):
+    def decode_source(self, toks, escape_unk=False):
+        with torch.no_grad():
+            s = self.src_dict.string(
+                toks.int().cpu(),
+                "@@ ",
+                # The default unknown string in fairseq is `<unk>`, but
+                # this is tokenized by sacrebleu as `< unk >`, inflating
+                # BLEU scores. Instead, we use a somewhat more verbose
+                # alternative that is unlikely to appear in the real
+                # reference, but doesn't get split into multiple tokens.
+                unk_string=(
+                    "UNKNOWNTOKENINREF" if escape_unk else "UNKNOWNTOKENINHYP"
+                ),
+            )
+            s = self.tokenizer.decode(s)
+        return s
+    def compute_reward(self, outputs, targets, src_tokens):
         """
         #we take a softmax over outputs
         probs = F.softmax(outputs, dim=-1)
@@ -96,84 +121,89 @@ class RLCriterion(FairseqCriterion):
         reward_vals = evaluate(sample_strings, targets)
         return reward_vals, samples_idx
         """
+        # bsz = outputs.size(0)
+        # seq_len = outputs.size(1)
+        # vocab_size = outputs.size(2)
+
+        # probs = F.softmax(outputs, dim=-1).view(bsz * seq_len, vocab_size)
+        # sample_idxs = torch.argmax(probs, dim=1).view(bsz, seq_len)
+        # rewards = torch.zeros(bsz, device='cuda')
+
+        # for batch_idx in range(bsz):
+        #     batch_mask = masks[batch_idx]
+        #     sample_idxs_masked = sample_idxs[batch_idx] * batch_mask
+        #     targets_masked = targets[batch_idx] * batch_mask
+        #     inputs = src_tokens[batch_idx]
+        #     sampled_sentence_string = self.decode(sample_idxs_masked.unsqueeze(0))
+        #     target_sentence = self.decode(targets_masked.unsqueeze(0))
+        #     inputs  = self.decode_source(inputs)
+        #     reward = self._evaluate(sampled_sentence_string, target_sentence, inputs)
+        #     rewards[batch_idx] = reward
+        # return reward_vals, samples_idx
         pass
 
-    def _compute_loss(self, outputs, targets, masks=None):
+    def _evaluate(self, sampled_string, target, source):
+      
+      if self.metric == "bleu":
+        reward = self.bleu_score([sampled_string], [[target]]) 
+      elif self.metric == "bleurt":
+        reward = self.bleurt_score(references=[target], candidates=[sampled_string])[0]
+      elif self.metric == "comet":
+        data = [{
+          "src": source,
+          "mt": sampled_string,
+          "ref": target
+        }]
+        print(data)
+        reward = self.comet_score(data, batch_size=8, gpus=1).system_score
+      else:
+        raise Exception(f"I do not know what is {self.metric} I am aware of only bleu bleurt and comet")
+      print(sampled_string)
+      print(target)
+      print(reward)
+      print("::::::::::::::::::::::::::::::::::::::::::::::::::")
+      return reward
+
+    def _compute_loss(self, outputs, targets, src_tokens, masks=None):
         """
         outputs: batch x len x d_model
         targets: batch x len
         masks:   batch x len
         """
+        bsz = outputs.size(0)
+        seq_len = outputs.size(1)
+        vocab_size = outputs.size(2)
 
-        #padding mask
-        ##If you take mask before you do sampling: you sample over a BATCH and your reward is on token level
-        #if you take mask after, you sample SENTENCES and calculate reward on a sentence level 
-        #but make sure you apply padding mask after both on log prob outputs, reward and id's (you might need them for gather function to           extract log_probs of the samples)
+        # Get the probabilities over vocab size
+        probs = F.softmax(outputs, dim=-1).view(bsz * seq_len, vocab_size)
+        sample_idxs = torch.argmax(probs, dim=1).view(bsz, seq_len)
+        rewards = torch.zeros(bsz, device='cuda')
 
-        #Example 1: mask before sampling
-        #if masks is not None:
-        #    outputs, targets = outputs[masks], targets[masks]
+        for batch_idx in range(bsz):
+            batch_mask = masks[batch_idx]
+            sample_idxs_masked = sample_idxs[batch_idx] * batch_mask
+            targets_masked = targets[batch_idx] * batch_mask
+            inputs = src_tokens[batch_idx]
+            sampled_sentence_string = self.decode(sample_idxs_masked.unsqueeze(0))
+            target_sentence = self.decode(targets_masked.unsqueeze(0))
+            inputs  = self.decode_source(inputs)
+            reward = self._evaluate(sampled_sentence_string, target_sentence, inputs)
+            rewards[batch_idx] = reward
 
-        #we take a softmax over outputs
-        #argmax over the softmax \ sampling (e.g. multinomial)
-        #sampled_sentence = [4, 17, 18, 19, 20]
-        #sampled_sentence_string = tgt_dict.string([4, 17, 18, 19, 20])
-        #target_sentence = "I am a sentence"
-        #with torch.no_grad()
-            #R(*) = eval_metric(sampled_sentence_string, target_sentence)
-            #R(*) is a number, BLEU, сhrf, etc.
-
-        #loss = -log_prob(outputs)*R()
-        #loss = loss.mean()
+        reward = rewards.unsqueeze(1).repeat(1, seq_len)
+        reward.requires_grad = True
 
         if masks is not None:
-            outputs, targets =  outputs[masks], targets[masks]
-            probs = F.softmax(outputs, dim=-1)
-            dist = Categorical(probs)
-            sampled_sentence = dist.sample() # OR sampled_sentence = argmax(...)
-            sampled_sentence_string = self.decode(sampled_sentence)
-            if self.metric == "bleu":
-                reward = sentence_bleu(sampled_sentence_string, targets)
-                loss = -dist.log_prob(sampled_sentence) * reward
-        
-            loss = loss.mean()
-        
-        #Example 2: mask after sampling
-        #bsz = outputs.size(0)
-        #seq_len = outputs.size(1)
-        #vocab_size = outputs.size(2)
-        #with torch.no_grad():
-        #probs = F.softmax(outputs, dim=-1).view(-1, vocab_size)
-        #sample_idx  = torch.multinomial(probs, 1,replacement=True).view(bsz, seq_len)
-        #print(sample_idx.shape)
-        #self.tgt_dict = task.tgt_dict in __init__()
-        #sampled_sentence_string = self.tgt_dict.string(sample_idx) #here you might also want to remove tokenization and bpe
-        #print(sampled_sentence_string) --> if you apply mask before, you get a sentence which is one token 
-        #imagine output[mask]=[MxV] where M is a sequence of all tokens in batch excluding padding symbols
-        #now you sample 1 vocabulary index for each token, so you end up in [Mx1] matrix
-        #when you apply string, it treats every token as a separate sentence --> hence you calc token-level metric. SO it makes much more sense to apply mask after sampling(!)
+          outputs, targets = outputs[masks], targets[masks]
+          reward, sample_idx = reward[masks], sample_idxs[masks]
 
-        ####HERE calculate metric###
-        #with torch.no_grad()
-        #reward = eval_metric(sampled_sentence_string, target_sentence)
-        #reward is a number, BLEU, сhrf, etc.
-        #expand it to make it of a shape BxT - each token gets the same reward value (e.g. bleu is 20, so each token gets reward of 20 [20,20,20,20,20])
-    
-        #now you need to apply mask on both outputs and reward
-        #if masks is not None:
-        #    outputs, targets = outputs[masks], targets[masks]
-        #    reward, sample_idx = reward[mask], sample_idx[mask]
-        #log_probs = F.log_probs(outputs, dim=-1)
-        #log_probs_of_samples = torch.gather(...)
-        #loss = -log_probs*reward
-        # loss = loss.mean()
-        
-        #For more about mask see notes on NLP2-notes-on-mask
-
-        else:
-            # TBD
-            loss = torch.Tensor([0]); reward = torch.Tensor([0])
-
+        # Log probabiltity of evereything
+        log_probs = torch.log(probs)
+        # Gather the part we sampled.
+        log_probs_of_samples = torch.gather(log_probs, 1, sample_idx.unsqueeze(1))
+        loss = -log_probs_of_samples * reward.unsqueeze(1)
+        loss = loss.mean()
+        # For more about mask see notes on NLP2-notes-on-mask
         return loss, reward.mean()
 
     @staticmethod
