@@ -7,6 +7,7 @@ task:
   noise: random_mask
 criterion:
   _name: rl_loss
+  sentence_level_metric: bleu
 model:
   _name: cmlm_transformer_base
   share_decoder_input_output_embed: true
@@ -28,12 +29,13 @@ dataset:
   max_tokens: 8192
   validate_interval_updates: 1000
 optimization:
-  lr: [0.0005]
+  lr: [0.00001]
   update_freq: [8]
-  max_update: 20000
+  max_update: 100
   stop_min_lr: 1e-09
 checkpoint:
+  save_dir : /content/checkpoint/bleu
   no_epoch_checkpoints: true
 common:
   log_format: simple
-  log_interval: 100
+  log_interval: 1

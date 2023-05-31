@@ -3,7 +3,7 @@ from argparse import Namespace
 import sys
 sys.path.append("/content/bleurt")
 from sys import builtin_module_names
-from torchmetrics import BLEUScore
+from torchmetrics import BLEUScore, CHRFScore
 import torch
 import torch.nn.functional as F
 from fairseq.criterions import FairseqCriterion, register_criterion
@@ -13,13 +13,16 @@ from dataclasses import dataclass, field
 from fairseq.logging import metrics
 from bleurt import score
 from comet import download_model, load_from_checkpoint
-checkpoint = "/content/bleurt/bleurt/BLEURT-20"
-
-
+import sacrebleu
+import nltk
+from nltk.translate import meteor_score
+from nltk import word_tokenize
+nltk.download('punkt')
+nltk.download('wordnet')
 @dataclass
 class RLCriterionConfig(FairseqDataclass):
     sentence_level_metric: str = field(default="bleu",
-                                       metadata={"help": "sentence level metrics bleu bleurt or comet"})
+                                       metadata={"help": "sentence level metrics bleu sacrebleu chrf meteor bleurt or comet"})
 
 
 @register_criterion("rl_loss", dataclass=RLCriterionConfig)
@@ -32,7 +35,10 @@ class RLCriterion(FairseqCriterion):
         ))
         self.tgt_dict = task.target_dictionary
         self.src_dict = task.source_dictionary
-        self.bleu_score = BLEUScore(n_gram=1)
+        self.bleu_score = BLEUScore(n_gram=4)
+        self.chrf_score = CHRFScore()
+        self.meteor_score = meteor_score.single_meteor_score
+        self.sacrebleu_score = sacrebleu.corpus_bleu
         if self.metric == "comet":
           model_path = download_model("Unbabel/wmt22-comet-da")
           comet_model = load_from_checkpoint(model_path)
@@ -146,6 +152,12 @@ class RLCriterion(FairseqCriterion):
       
       if self.metric == "bleu":
         reward = self.bleu_score([sampled_string], [[target]]) 
+      elif self.metric == "chrf": 
+        reward = self.chrf_score([sampled_string], [[target]])
+      elif self.metric == "meteor":
+        reward = self.meteor_score(sampled_string.split(" "), target.split(" "))
+      elif self.metric == "sacrebleu":
+        reward = self.sacrebleu_score([sampled_string], [[target]]).score
       elif self.metric == "bleurt":
         reward = self.bleurt_score(references=[target], candidates=[sampled_string])[0]
       elif self.metric == "comet":
@@ -154,14 +166,9 @@ class RLCriterion(FairseqCriterion):
           "mt": sampled_string,
           "ref": target
         }]
-        print(data)
         reward = self.comet_score(data, batch_size=8, gpus=1).system_score
       else:
         raise Exception(f"I do not know what is {self.metric} I am aware of only bleu bleurt and comet")
-      print(sampled_string)
-      print(target)
-      print(reward)
-      print("::::::::::::::::::::::::::::::::::::::::::::::::::")
       return reward
 
     def _compute_loss(self, outputs, targets, src_tokens, masks=None):

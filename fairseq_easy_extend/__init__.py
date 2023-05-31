@@ -8,6 +8,7 @@ import fairseq_easy_extend.criterions  # noqa
 import fairseq_easy_extend.models  # noqa
 import fairseq_easy_extend.tasks  # noqa
 import fairseq_easy_extend.dataclass  # noqa
+import fairseq_easy_extend.scoring  # noqa
 
 import fairseq.distributed  # noqa
 import fairseq.optim  # noqa
